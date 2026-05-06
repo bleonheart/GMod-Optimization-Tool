@@ -214,6 +214,5 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
-
-# Config file
-config.json
+settings.json
+*.md
