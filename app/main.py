@@ -35,6 +35,30 @@ from utils.addon_merge_clean_split import merge_addon_workflow, extract_missing_
 from utils.remove_comments import remove_comments_from_directory
 from utils.remove_empty_folders import remove_empty_folders
 
+FULL_IMAGE_WORKFLOW_STEPS = [
+    ('dds_to_png', 'Convert DDS files to PNG'),
+    ('images_to_png', 'Convert images to PNG'),
+    ('vtf_to_dxt', 'Convert VTFs to DXT'),
+    ('clamp_vtf', 'Clamp VTF file sizes to 1024px'),
+    ('remove_mipmaps', 'Remove mipmaps'),
+    ('resave_vtf', 'Resave VTF files (autorefresh)'),
+    ('clamp_png', 'Clamp PNG files to 512px'),
+]
+FULL_SOUND_WORKFLOW_STEPS = [
+    ('sounds_to_ogg', 'Convert sound files to OGG'),
+    ('resample_oggs', 'Resample unsupported OGG sample rates'),
+    ('strip_audio_metadata', 'Strip audio metadata'),
+]
+FULL_WORKFLOW_STEPS = [
+    ('unused_model_formats', 'Remove unused model formats'),
+    ('remove_game_files', "Remove files already provided by Garry's Mod"),
+    ('remove_empty_folders', 'Remove empty folders'),
+    ('remove_comments', 'Remove comments from Lua files'),
+    *FULL_IMAGE_WORKFLOW_STEPS,
+    *FULL_SOUND_WORKFLOW_STEPS,
+    ('missing_materials_report', 'Generate a missing materials report'),
+]
+
 class SignalStream(QtCore.QObject):
     text_emitted = QtCore.Signal(str)
 
@@ -207,13 +231,13 @@ class MainWindow(QtWidgets.QMainWindow):
         audio_grid = QtWidgets.QGridLayout()
         audio_grid.setHorizontalSpacing(12)
         audio_grid.setVerticalSpacing(8)
-        add_button(audio_grid, 0, 'Convert sound to OGG', self.on_sounds_to_ogg, recommended=True, tooltip='Convert all WAV and MP3 sound files in the content folder to OGG at 41 kHz.\nSkips WAV files with loop or cue points.')
+        add_button(audio_grid, 0, 'Convert sound to OGG', self.on_sounds_to_ogg, recommended=True, tooltip='Convert all WAV and MP3 sound files in the content folder to OGG at 44.1 kHz.\nSkips WAV files with loop or cue points.')
         add_button(audio_grid, 1, 'Trim silence', self.on_trim_empty_audio, tooltip='Remove silent audio from the start and end of sound files.\nApplies a fade-out at the tail to prevent hard cuts.')
         add_button(audio_grid, 2, 'Re-encode existing OGGs', self.on_reencode_oggs, tooltip='Re-encode all OGG files in the content folder at a specified bitrate (64–128 kbps).\nCan significantly reduce size of OGG files that were encoded at a high bitrate.')
-        add_button(audio_grid, 3, 'Resample', self.on_resample_oggs, tooltip='Resample any OGG files not already at 41000Hz to 41kHz.\nUseful for OGGs that came in at 44.1kHz or 48kHz.')
+        add_button(audio_grid, 3, 'Resample', self.on_resample_oggs, tooltip='Resample any OGG files not already at 44100Hz to 44.1kHz.\nUseful for OGGs that came in at 22.05kHz, 11.025kHz, or 48kHz.')
         add_button(audio_grid, 4, 'Normalize the volume', self.on_normalize_audio, tooltip="Normalize loudness of all audio files to -14 LUFS using ffmpeg's loudnorm filter.\nHelps with inconsistently loud or quiet sounds.")
         add_button(audio_grid, 5, 'Strip metadata from audio', self.on_strip_audio_metadata, recommended=True, tooltip='Remove embedded album art, tags, and other metadata from OGG and MP3 files.\nReduces file size without affecting audio quality.')
-        add_button(audio_grid, 6, 'Run Full Sound Workflow', self.on_run_full_sound_workflow, recommended=True, tooltip='Run the full sound cleanup workflow on the current content folder.\nIncludes OGG conversion and metadata stripping.')
+        add_button(audio_grid, 6, 'Run Full Sound Workflow', self.on_run_full_sound_workflow, recommended=True, tooltip='Run the full sound cleanup workflow on the current content folder.\nIncludes OGG conversion, OGG resampling, and metadata stripping.')
         audio_group.setLayout(audio_grid)
         actions_layout.addWidget(audio_group)
         merge_group = QtWidgets.QGroupBox('File Merging')
@@ -560,6 +584,57 @@ class MainWindow(QtWidgets.QMainWindow):
         if dialog.exec() != QtWidgets.QDialog.Accepted:
             return None
         return {'remove': remove_checkbox.isChecked()}
+
+    def ask_full_workflow_options(self) -> dict | None:
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle('Full Workflow Options')
+        dialog.resize(520, 420)
+        layout = QtWidgets.QVBoxLayout(dialog)
+        description = QtWidgets.QLabel('Choose any full-workflow steps you want to skip. Leave everything unchecked to run the standard full workflow.')
+        description.setWordWrap(True)
+        layout.addWidget(description)
+        scroll_area = QtWidgets.QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QtWidgets.QFrame.NoFrame)
+        scroll_contents = QtWidgets.QWidget()
+        scroll_layout = QtWidgets.QVBoxLayout(scroll_contents)
+        scroll_layout.setContentsMargins(0, 0, 0, 0)
+        scroll_layout.setSpacing(6)
+        step_checkboxes = {}
+        for step_key, step_label in FULL_WORKFLOW_STEPS:
+            checkbox = QtWidgets.QCheckBox(f'Skip: {step_label}')
+            step_checkboxes[step_key] = checkbox
+            scroll_layout.addWidget(checkbox)
+        scroll_layout.addStretch()
+        scroll_area.setWidget(scroll_contents)
+        layout.addWidget(scroll_area)
+        button_box = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        button_box.accepted.connect(dialog.accept)
+        button_box.rejected.connect(dialog.reject)
+        layout.addWidget(button_box)
+        if dialog.exec() != QtWidgets.QDialog.Accepted:
+            return None
+        excluded_steps = {step_key for step_key, checkbox in step_checkboxes.items() if checkbox.isChecked()}
+        if len(excluded_steps) == len(FULL_WORKFLOW_STEPS):
+            QtWidgets.QMessageBox.warning(self, 'No workflow steps selected', 'At least one full-workflow step must remain enabled.')
+            return self.ask_full_workflow_options()
+        return {'excluded_steps': excluded_steps}
+
+    def build_full_workflow_summary_lines(self, content_folder: str, gmod_folder: str, excluded_steps: set[str] | None=None, benchmark: bool=False) -> list[str]:
+        excluded_steps = excluded_steps or set()
+        active_steps = [label for step_key, label in FULL_WORKFLOW_STEPS if step_key not in excluded_steps]
+        skipped_steps = [label for step_key, label in FULL_WORKFLOW_STEPS if step_key in excluded_steps]
+        summary_lines = [f"Content folder: '{content_folder}'", f"GMod folder: '{gmod_folder}'", '']
+        if benchmark:
+            summary_lines.extend(['This benchmark will:', '1. Clone the content folder to a temporary benchmark location', '2. Run the selected full-workflow steps on the clone', '3. Measure before/after folder size', '4. Delete the benchmark clone afterwards', ''])
+        summary_lines.append('Included steps:')
+        summary_lines.extend(f'{index}. {label}' for index, label in enumerate(active_steps, start=1))
+        if skipped_steps:
+            summary_lines.extend(['', 'Skipped steps:'])
+            summary_lines.extend(f'- {label}' for label in skipped_steps)
+        if 'missing_materials_report' not in excluded_steps:
+            summary_lines.extend(['', 'Reports will be saved in the project root.'])
+        return summary_lines
 
     def ask_int(self, title: str, label: str, default: int=1024) -> int | None:
         value, ok = QtWidgets.QInputDialog.getInt(self, title, label, value=default, minValue=1, maxValue=10000000, step=1)
@@ -1114,7 +1189,7 @@ class MainWindow(QtWidgets.QMainWindow):
         def task():
 
             def run_for_addon(addon_path, *_args):
-                return resample_oggs(addon_path, target_rate=41000, progress_callback=self.worker.progress.emit)
+                return resample_oggs(addon_path, target_rate=44100, progress_callback=self.worker.progress.emit)
             return self.run_content_targets(folder, 'Resample', run_for_addon)
         self.start_task('Resample', task, determinate=True, modified_folder=folder)
 
@@ -1152,7 +1227,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         if not self.ensure_ffmpeg_for_action('Run Full Sound Workflow'):
             return
-        summary_lines = [f"Content folder: '{folder}'", '', 'This workflow will:', '1. Convert sound files to OGG', '2. Strip audio metadata']
+        summary_lines = [f"Content folder: '{folder}'", '', 'This workflow will:', '1. Convert sound files to OGG', '2. Resample unsupported OGG sample rates', '3. Strip audio metadata']
         if not self.ask_yes_no('Run full sound workflow?', '\n'.join(summary_lines)):
             return
         self.start_task('Full sound workflow', lambda: self.run_full_sound_workflow_task(folder), determinate=True, modified_folder=folder)
@@ -1413,12 +1488,16 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         if not self.ensure_ffmpeg_for_action('Run Full Workflow (Except Merge)'):
             return
+        options = self.ask_full_workflow_options()
+        if not options:
+            return
         content_folder, gmod_folder = validated
         missing_materials_report = os.path.join(PROJECT_ROOT, 'missing_materials_report.md')
-        summary_lines = [f"Content folder: '{content_folder}'", f"GMod folder: '{gmod_folder}'", '', 'This workflow will:', '1. Remove unused model formats', "2. Remove files already provided by Garry's Mod", '3. Remove empty folders', '4. Remove comments from Lua files', '5. Convert DDS files to PNG', '6. Convert images to PNG', '7. Convert VTFs to DXT', '8. Clamp VTF file sizes to 1024px', '9. Remove mipmaps', '10. Resave VTF files (autorefresh)', '11. Clamp PNG files to 512px', '12. Convert sound files to OGG', '13. Strip audio metadata', '14. Generate a missing materials report', '', 'Reports will be saved in the project root.']
+        excluded_steps = options['excluded_steps']
+        summary_lines = self.build_full_workflow_summary_lines(content_folder, gmod_folder, excluded_steps=excluded_steps)
         if not self.ask_yes_no('Run full workflow?', '\n'.join(summary_lines)):
             return
-        self.start_task('Full workflow (except merge)', lambda: self.run_full_workflow_task(content_folder, gmod_folder, missing_materials_report), modified_folder=content_folder)
+        self.start_task('Full workflow (except merge)', lambda: self.run_full_workflow_task(content_folder, gmod_folder, missing_materials_report, excluded_steps=excluded_steps), modified_folder=content_folder)
 
     def on_benchmark_full_image_workflow(self):
         folder = self.ensure_content_folder()
@@ -1458,11 +1537,15 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         if not self.ensure_ffmpeg_for_action('Benchmark Full Workflow'):
             return
+        options = self.ask_full_workflow_options()
+        if not options:
+            return
         content_folder, gmod_folder = validated
-        summary_lines = [f"Content folder: '{content_folder}'", f"GMod folder: '{gmod_folder}'", '', 'This benchmark will:', '1. Clone the content folder to a temporary benchmark location', '2. Run the full workflow on the clone', '3. Measure before/after folder size', '4. Delete the benchmark clone afterwards']
+        excluded_steps = options['excluded_steps']
+        summary_lines = self.build_full_workflow_summary_lines(content_folder, gmod_folder, excluded_steps=excluded_steps, benchmark=True)
         if not self.ask_yes_no('Run full workflow benchmark?', '\n'.join(summary_lines)):
             return
-        self.start_task('Benchmark full workflow', lambda: self.run_benchmark_workflow_task(content_folder, 'Full Workflow', lambda clone_folder: self.run_full_workflow_task(clone_folder, gmod_folder, os.path.join(clone_folder, 'missing_materials_report.md'))), determinate=True)
+        self.start_task('Benchmark full workflow', lambda: self.run_benchmark_workflow_task(content_folder, 'Full Workflow', lambda clone_folder: self.run_full_workflow_task(clone_folder, gmod_folder, os.path.join(clone_folder, 'missing_materials_report.md'), excluded_steps=excluded_steps)), determinate=True)
 
     def run_cleanup_workflow_task(self, content_folder: str, gmod_folder: str):
 
@@ -1488,24 +1571,41 @@ class MainWindow(QtWidgets.QMainWindow):
             return (total_saved, total_files)
         return self.run_content_targets(content_folder, 'Cleanup workflow', run_for_addon)
 
-    def run_full_workflow_task(self, content_folder: str, gmod_folder: str, missing_materials_report: str):
+    def run_full_workflow_task(self, content_folder: str, gmod_folder: str, missing_materials_report: str, excluded_steps: set[str] | None=None):
+        excluded_steps = excluded_steps or set()
+        total_steps = sum(1 for step_key, _label in FULL_WORKFLOW_STEPS if step_key not in excluded_steps)
 
         def run_for_addon(addon_path, addon_name, _index, _total, is_multi):
             print('')
             print('=' * 80)
             print('RUNNING FULL WORKFLOW (EXCEPT MERGE)')
             print('=' * 80)
-            print('\n[1/14] Removing unused model formats...')
-            model_format_size, model_format_count = unused_model_formats(addon_path, True)
-            print(f'Removed {model_format_count} unused model format files, saving {format_size(model_format_size)}')
-            print("\n[2/14] Removing files already in Garry's Mod...")
-            remove_game_files(addon_path, gmod_folder, True)
-            print('\n[3/14] Removing empty folders...')
-            remove_empty_folders(addon_path)
-            print('\n[4/14] Removing comments from Lua files...')
-            comments_size, comments_count = remove_comments_from_directory(addon_path)
-            print(f'Removed comments from {comments_count} Lua files, saving {format_size(comments_size)}')
-            image_saved, image_counts = self.run_full_image_workflow_for_addon(addon_path, step_offset=4, total_steps=14)
+            step_number = 0
+            model_format_size = 0
+            model_format_count = 0
+            comments_size = 0
+            comments_count = 0
+            empty_folder_count = 0
+            if 'unused_model_formats' not in excluded_steps:
+                step_number += 1
+                print(f'\n[{step_number}/{total_steps}] Removing unused model formats...')
+                model_format_size, model_format_count = unused_model_formats(addon_path, True)
+                print(f'Removed {model_format_count} unused model format files, saving {format_size(model_format_size)}')
+            if 'remove_game_files' not in excluded_steps:
+                step_number += 1
+                print(f"\n[{step_number}/{total_steps}] Removing files already in Garry's Mod...")
+                remove_game_files(addon_path, gmod_folder, True)
+            if 'remove_empty_folders' not in excluded_steps:
+                step_number += 1
+                print(f'\n[{step_number}/{total_steps}] Removing empty folders...')
+                empty_folder_count = remove_empty_folders(addon_path)
+                print(f'Removed {empty_folder_count} empty folders')
+            if 'remove_comments' not in excluded_steps:
+                step_number += 1
+                print(f'\n[{step_number}/{total_steps}] Removing comments from Lua files...')
+                comments_size, comments_count = remove_comments_from_directory(addon_path)
+                print(f'Removed comments from {comments_count} Lua files, saving {format_size(comments_size)}')
+            image_saved, image_counts = self.run_full_image_workflow_for_addon(addon_path, step_offset=step_number, total_steps=total_steps, excluded_steps=excluded_steps)
             dds_size = image_saved['dds_size']
             img_size = image_saved['img_size']
             dxt_size = image_saved['dxt_size']
@@ -1519,21 +1619,27 @@ class MainWindow(QtWidgets.QMainWindow):
             mipmap_count = image_counts['mipmap_count']
             vtf_resave_count = image_counts['vtf_resave_count']
             png_count = image_counts['png_count']
-            sound_saved, sound_counts = self.run_full_sound_workflow_for_addon(addon_path, step_offset=11, total_steps=14)
+            step_number += sum(1 for step_key, _label in FULL_IMAGE_WORKFLOW_STEPS if step_key not in excluded_steps)
+            sound_saved, sound_counts = self.run_full_sound_workflow_for_addon(addon_path, step_offset=step_number, total_steps=total_steps, excluded_steps=excluded_steps)
             ogg_size = sound_saved['ogg_size']
+            resample_size = sound_saved['resample_size']
             metadata_size = sound_saved['metadata_size']
             ogg_count = sound_counts['ogg_count']
+            resample_count = sound_counts['resample_count']
             metadata_count = sound_counts['metadata_count']
-            addon_report = self.build_addon_output_file(missing_materials_report, addon_name, is_multi)
-            print('\n[14/14] Generating missing materials report...')
-            total_models, models_with_materials, total_materials, missing_materials = extract_missing_materials_to_markdown(addon_path, addon_report, gmod_dir=gmod_folder)
-            print(f'Scanned {total_models} models')
-            print(f'  - {models_with_materials} models have materials')
-            print(f'  - {total_materials} total material directories found')
-            print(f'  - {missing_materials} missing material directories')
-            print(f'Report saved to: {addon_report}')
-            total_saved = model_format_size + comments_size + dds_size + img_size + dxt_size + vtf_clamp_size + mipmap_size + png_size + ogg_size + metadata_size
-            total_files = model_format_count + comments_count + dds_count + img_count + dxt_count + vtf_clamp_count + mipmap_count + vtf_resave_count + png_count + ogg_count + metadata_count
+            step_number += sum(1 for step_key, _label in FULL_SOUND_WORKFLOW_STEPS if step_key not in excluded_steps)
+            if 'missing_materials_report' not in excluded_steps:
+                step_number += 1
+                addon_report = self.build_addon_output_file(missing_materials_report, addon_name, is_multi)
+                print(f'\n[{step_number}/{total_steps}] Generating missing materials report...')
+                total_models, models_with_materials, total_materials, missing_materials = extract_missing_materials_to_markdown(addon_path, addon_report, gmod_dir=gmod_folder)
+                print(f'Scanned {total_models} models')
+                print(f'  - {models_with_materials} models have materials')
+                print(f'  - {total_materials} total material directories found')
+                print(f'  - {missing_materials} missing material directories')
+                print(f'Report saved to: {addon_report}')
+            total_saved = model_format_size + comments_size + dds_size + img_size + dxt_size + vtf_clamp_size + mipmap_size + png_size + ogg_size + resample_size + metadata_size
+            total_files = model_format_count + empty_folder_count + comments_count + dds_count + img_count + dxt_count + vtf_clamp_count + mipmap_count + vtf_resave_count + png_count + ogg_count + resample_count + metadata_count
             print('\nFull workflow completed successfully.')
             return (total_saved, total_files)
         return self.run_content_targets(content_folder, 'Full workflow', run_for_addon)
@@ -1587,45 +1693,93 @@ class MainWindow(QtWidgets.QMainWindow):
             return self.run_full_image_workflow_for_addon(content_folder, step_offset=step_offset, total_steps=total_steps)
         return self.run_content_targets(content_folder, 'Full image workflow', lambda addon_path, *_args: self.run_full_image_workflow_for_addon(addon_path, step_offset=step_offset, total_steps=total_steps), result_mapper=lambda result: (sum(result[0].values()), sum(result[1].values())))
 
-    def run_full_image_workflow_for_addon(self, content_folder: str, step_offset: int=0, total_steps: int=7):
-        print(f'\n[{step_offset + 1}/{total_steps}] Converting DDS files to PNG...')
-        dds_size, dds_count = convert_dds_to_png(content_folder, delete_originals=True, progress_callback=self.worker.progress.emit)
-        print(f'Converted {dds_count} DDS files, saving {format_size(dds_size)}')
-        print(f'\n[{step_offset + 2}/{total_steps}] Converting images to PNG...')
-        img_size, img_count = convert_images_to_png(content_folder, progress_callback=self.worker.progress.emit)
-        print(f'Converted {img_count} image files, saving {format_size(img_size)}')
-        print(f'\n[{step_offset + 3}/{total_steps}] Converting VTF files to DXT...')
-        dxt_size, dxt_count = resize_and_compress(content_folder, 1000000, progress_callback=self.worker.progress.emit)
-        print(f'Processed {dxt_count} VTF files, saving {format_size(dxt_size)}')
-        print(f'\n[{step_offset + 4}/{total_steps}] Clamping VTF file sizes to 1024px...')
-        vtf_clamp_size, vtf_clamp_count = resize_and_compress(content_folder, 1024, progress_callback=self.worker.progress.emit)
-        print(f'Processed {vtf_clamp_count} VTF files, saving {format_size(vtf_clamp_size)}')
-        print(f'\n[{step_offset + 5}/{total_steps}] Removing mipmaps...')
-        mipmap_size, mipmap_count = remove_mipmaps(content_folder, progress_callback=self.worker.progress.emit)
-        print(f'Removed mipmaps from {mipmap_count} VTF files, saving {format_size(mipmap_size)}')
-        print(f'\n[{step_offset + 6}/{total_steps}] Resaving VTF files (autorefresh)...')
-        vtf_resave_count = self.resave_vtf_files(content_folder)
-        print(f'Resaved {vtf_resave_count} VTF files.')
-        print(f'\n[{step_offset + 7}/{total_steps}] Clamping PNG file sizes to 512px...')
-        png_size, png_count = clamp_pngs(content_folder, 512, progress_callback=self.worker.progress.emit)
-        print(f'Processed {png_count} PNG files, saving {format_size(png_size)}')
-        print('\nFull image workflow completed successfully.')
+    def run_full_image_workflow_for_addon(self, content_folder: str, step_offset: int=0, total_steps: int=7, excluded_steps: set[str] | None=None):
+        excluded_steps = excluded_steps or set()
+        dds_size = 0
+        dds_count = 0
+        img_size = 0
+        img_count = 0
+        dxt_size = 0
+        dxt_count = 0
+        vtf_clamp_size = 0
+        vtf_clamp_count = 0
+        mipmap_size = 0
+        mipmap_count = 0
+        vtf_resave_count = 0
+        png_size = 0
+        png_count = 0
+        step_number = step_offset
+        if 'dds_to_png' not in excluded_steps:
+            step_number += 1
+            print(f'\n[{step_number}/{total_steps}] Converting DDS files to PNG...')
+            dds_size, dds_count = convert_dds_to_png(content_folder, delete_originals=True, progress_callback=self.worker.progress.emit)
+            print(f'Converted {dds_count} DDS files, saving {format_size(dds_size)}')
+        if 'images_to_png' not in excluded_steps:
+            step_number += 1
+            print(f'\n[{step_number}/{total_steps}] Converting images to PNG...')
+            img_size, img_count = convert_images_to_png(content_folder, progress_callback=self.worker.progress.emit)
+            print(f'Converted {img_count} image files, saving {format_size(img_size)}')
+        if 'vtf_to_dxt' not in excluded_steps:
+            step_number += 1
+            print(f'\n[{step_number}/{total_steps}] Converting VTF files to DXT...')
+            dxt_size, dxt_count = resize_and_compress(content_folder, 1000000, progress_callback=self.worker.progress.emit)
+            print(f'Changed {dxt_count} VTF files, saving {format_size(dxt_size)}')
+        if 'clamp_vtf' not in excluded_steps:
+            step_number += 1
+            print(f'\n[{step_number}/{total_steps}] Clamping VTF file sizes to 1024px...')
+            vtf_clamp_size, vtf_clamp_count = resize_and_compress(content_folder, 1024, progress_callback=self.worker.progress.emit)
+            print(f'Changed {vtf_clamp_count} VTF files, saving {format_size(vtf_clamp_size)}')
+        if 'remove_mipmaps' not in excluded_steps:
+            step_number += 1
+            print(f'\n[{step_number}/{total_steps}] Removing mipmaps...')
+            mipmap_size, mipmap_count = remove_mipmaps(content_folder, progress_callback=self.worker.progress.emit)
+            print(f'Removed mipmaps from {mipmap_count} VTF files, saving {format_size(mipmap_size)}')
+        if 'resave_vtf' not in excluded_steps:
+            step_number += 1
+            print(f'\n[{step_number}/{total_steps}] Resaving VTF files (autorefresh)...')
+            vtf_resave_count = self.resave_vtf_files(content_folder)
+            print(f'Resaved {vtf_resave_count} VTF files.')
+        if 'clamp_png' not in excluded_steps:
+            step_number += 1
+            print(f'\n[{step_number}/{total_steps}] Clamping PNG file sizes to 512px...')
+            png_size, png_count = clamp_pngs(content_folder, 512, progress_callback=self.worker.progress.emit)
+            print(f'Processed {png_count} PNG files, saving {format_size(png_size)}')
+        if step_number > step_offset:
+            print('\nFull image workflow completed successfully.')
         return ({'dds_size': dds_size, 'img_size': img_size, 'dxt_size': dxt_size, 'vtf_clamp_size': vtf_clamp_size, 'mipmap_size': mipmap_size, 'png_size': png_size}, {'dds_count': dds_count, 'img_count': img_count, 'dxt_count': dxt_count, 'vtf_clamp_count': vtf_clamp_count, 'mipmap_count': mipmap_count, 'vtf_resave_count': vtf_resave_count, 'png_count': png_count})
 
-    def run_full_sound_workflow_task(self, content_folder: str, step_offset: int=0, total_steps: int=2):
+    def run_full_sound_workflow_task(self, content_folder: str, step_offset: int=0, total_steps: int=3):
         if self.is_addon_content_folder(content_folder):
             return self.run_full_sound_workflow_for_addon(content_folder, step_offset=step_offset, total_steps=total_steps)
         return self.run_content_targets(content_folder, 'Full sound workflow', lambda addon_path, *_args: self.run_full_sound_workflow_for_addon(addon_path, step_offset=step_offset, total_steps=total_steps), result_mapper=lambda result: (sum(result[0].values()), sum(result[1].values())))
 
-    def run_full_sound_workflow_for_addon(self, content_folder: str, step_offset: int=0, total_steps: int=2):
-        print(f'\n[{step_offset + 1}/{total_steps}] Converting sound files to OGG...')
-        ogg_size, ogg_count = sounds_to_ogg(content_folder, progress_callback=self.worker.progress.emit)
-        print(f'Converted {ogg_count} sound files, saving {format_size(ogg_size)}')
-        print(f'\n[{step_offset + 2}/{total_steps}] Stripping audio metadata...')
-        metadata_size, metadata_count = strip_audio_metadata(content_folder, progress_callback=self.worker.progress.emit)
-        print(f'Stripped metadata from {metadata_count} audio files, saving {format_size(metadata_size)}')
-        print('\nFull sound workflow completed successfully.')
-        return ({'ogg_size': ogg_size, 'metadata_size': metadata_size}, {'ogg_count': ogg_count, 'metadata_count': metadata_count})
+    def run_full_sound_workflow_for_addon(self, content_folder: str, step_offset: int=0, total_steps: int=3, excluded_steps: set[str] | None=None):
+        excluded_steps = excluded_steps or set()
+        ogg_size = 0
+        ogg_count = 0
+        resample_size = 0
+        resample_count = 0
+        metadata_size = 0
+        metadata_count = 0
+        step_number = step_offset
+        if 'sounds_to_ogg' not in excluded_steps:
+            step_number += 1
+            print(f'\n[{step_number}/{total_steps}] Converting sound files to OGG...')
+            ogg_size, ogg_count = sounds_to_ogg(content_folder, progress_callback=self.worker.progress.emit)
+            print(f'Converted {ogg_count} sound files, saving {format_size(ogg_size)}')
+        if 'resample_oggs' not in excluded_steps:
+            step_number += 1
+            print(f'\n[{step_number}/{total_steps}] Resampling unsupported OGG sample rates...')
+            resample_size, resample_count = resample_oggs(content_folder, target_rate=44100, progress_callback=self.worker.progress.emit)
+            print(f'Resampled {resample_count} OGG files, saving {format_size(resample_size)}')
+        if 'strip_audio_metadata' not in excluded_steps:
+            step_number += 1
+            print(f'\n[{step_number}/{total_steps}] Stripping audio metadata...')
+            metadata_size, metadata_count = strip_audio_metadata(content_folder, progress_callback=self.worker.progress.emit)
+            print(f'Stripped metadata from {metadata_count} audio files, saving {format_size(metadata_size)}')
+        if step_number > step_offset:
+            print('\nFull sound workflow completed successfully.')
+        return ({'ogg_size': ogg_size, 'resample_size': resample_size, 'metadata_size': metadata_size}, {'ogg_count': ogg_count, 'resample_count': resample_count, 'metadata_count': metadata_count})
 
     def resave_vtf_files(self, content_folder: str) -> int:
         vtf_resave_count = 0

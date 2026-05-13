@@ -128,7 +128,7 @@ This mode will:
   Re-encode `.ogg` files at a chosen bitrate to shrink oversized audio that was encoded too aggressively.
 
 - `Resample`  
-  Resample `.ogg` files to 41 kHz when needed for a more consistent audio set.
+  Resample `.ogg` files to 44.1 kHz when needed for a more consistent audio set.
 
 - `Normalize the volume`  
   Normalize loudness across audio files so packs sound more consistent in-game.
